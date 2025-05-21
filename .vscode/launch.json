@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "probe-rs-debug",
+      "request": "attach",
+      "name": "probe_rs Executable Test",
+      "chip": "rp2040",
+      "coreConfigs": [
+        {
+          "programBinary": "${workspaceRoot}/target/thumbv6m-none-eabi/debug/pico-rust-stock-ticker",
+        }
+      ]
+    }
+  ]
+}
