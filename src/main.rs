@@ -1,28 +1,45 @@
 //! This example uses the RP Pico W board Wifi chip (cyw43).
-//! Scans Wifi for ssid names.
+//! Connects to Wifi network and makes a web request to get the current time.
 
 #![no_std]
 #![no_main]
 #![allow(async_fn_in_trait)]
 
-use core::str;
+use core::str::from_utf8;
 
+use cyw43::JoinOptions;
 use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_net::dns::DnsSocket;
+use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use embassy_net::{Config, StackResources};
 use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0};
 use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_time::{Duration, Timer};
+use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
+use reqwless::request::Method;
+use serde::Deserialize;
 use static_cell::StaticCell;
-use {defmt_rtt as _, panic_probe as _};
+use {defmt_rtt as _, panic_probe as _, serde_json_core};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
 });
 
+const WIFI_NETWORK: &str = "VM27FB58"; // change to your network SSID
+const WIFI_PASSWORD: &str = "jngfv7Rjmnay"; // change to your network password
+
 #[embassy_executor::task]
 async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
+    runner.run().await
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
 }
 
@@ -31,10 +48,10 @@ async fn main(spawner: Spawner) {
     info!("Hello World!");
 
     let p = embassy_rp::init(Default::default());
+    let mut rng = RoscRng;
 
-    // let fw = include_bytes!("../cyw43-firmware/43439A0.bin");
-    // let clm = include_bytes!("../cyw43-firmware/43439A0_clm.bin");
-
+    // let fw = include_bytes!("../../../../cyw43-firmware/43439A0.bin");
+    // let clm = include_bytes!("../../../../cyw43-firmware/43439A0_clm.bin");
     // To make flashing faster for development, you may want to flash the firmwares independently
     // at hardcoded addresses, instead of baking them into the program with `include_bytes!`:
     //     probe-rs download 43439A0.bin --binary-format bin --chip RP2040 --base-address 0x10100000
@@ -58,7 +75,7 @@ async fn main(spawner: Spawner) {
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw).await;
     unwrap!(spawner.spawn(cyw43_task(runner)));
 
     control.init(clm).await;
@@ -66,10 +83,116 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
-    let mut scanner = control.scan(Default::default()).await;
-    while let Some(bss) = scanner.next().await {
-        if let Ok(ssid_str) = str::from_utf8(&bss.ssid) {
-            info!("scanned {} == {:x}", ssid_str, bss.bssid);
+    let config = Config::dhcpv4(Default::default());
+    // Use static IP configuration instead of DHCP
+    //let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
+    //    address: Ipv4Cidr::new(Ipv4Address::new(192, 168, 69, 2), 24),
+    //    dns_servers: Vec::new(),
+    //    gateway: Some(Ipv4Address::new(192, 168, 69, 1)),
+    //});
+
+    // Generate random seed
+    let seed = rng.next_u64();
+
+    // Init network stack
+    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
+    let (stack, runner) = embassy_net::new(net_device, config, RESOURCES.init(StackResources::new()), seed);
+
+    unwrap!(spawner.spawn(net_task(runner)));
+
+    loop {
+        match control
+            .join(WIFI_NETWORK, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
+            .await
+        {
+            Ok(_) => break,
+            Err(err) => {
+                info!("join failed with status={}", err.status);
+            }
         }
+    }
+
+    // Wait for DHCP, not necessary when using static IP
+    info!("waiting for DHCP...");
+    while !stack.is_config_up() {
+        Timer::after_millis(100).await;
+    }
+    info!("DHCP is now up!");
+
+    info!("waiting for link up...");
+    while !stack.is_link_up() {
+        Timer::after_millis(500).await;
+    }
+    info!("Link is up!");
+
+    info!("waiting for stack to be up...");
+    stack.wait_config_up().await;
+    info!("Stack is up!");
+
+    // And now we can use it!
+
+    loop {
+        let mut rx_buffer = [0; 8192];
+        let mut tls_read_buffer = [0; 16640];
+        let mut tls_write_buffer = [0; 16640];
+
+        let client_state = TcpClientState::<1, 1024, 1024>::new();
+        let tcp_client = TcpClient::new(stack, &client_state);
+        let dns_client = DnsSocket::new(stack);
+        let tls_config = TlsConfig::new(seed, &mut tls_read_buffer, &mut tls_write_buffer, TlsVerify::None);
+
+        let mut http_client = HttpClient::new_with_tls(&tcp_client, &dns_client, tls_config);
+        let url = "https://jsonplaceholder.typicode.com/todos/1";
+        // for non-TLS requests, use this instead:
+        // let mut http_client = HttpClient::new(&tcp_client, &dns_client);
+        // let url = "http://worldtimeapi.org/api/timezone/Europe/Berlin";
+
+        info!("connecting to {}", &url);
+
+        let mut request = match http_client.request(Method::GET, &url).await {
+            Ok(req) => req,
+            Err(e) => {
+                error!("Failed to make HTTP request: {:?}", e);
+                return; // handle the error
+            }
+        };
+
+        let response = match request.send(&mut rx_buffer).await {
+            Ok(resp) => resp,
+            Err(_e) => {
+                error!("Failed to send HTTP request");
+                return; // handle the error;
+            }
+        };
+
+        let body = match from_utf8(response.body().read_to_end().await.unwrap()) {
+            Ok(b) => b,
+            Err(_e) => {
+                error!("Failed to read response body");
+                return; // handle the error
+            }
+        };
+        info!("Response body: {:?}", &body);
+
+        // parse the response body and update the RTC
+
+        #[derive(Deserialize)]
+        struct ApiResponse<'a> {
+            title: &'a str,
+            // other fields as needed
+        }
+
+        let bytes = body.as_bytes();
+        match serde_json_core::de::from_slice::<ApiResponse>(bytes) {
+            Ok((output, _used)) => {
+                info!("Title: {:?}", output.title);
+            }
+            Err(_e) => {
+                error!("Failed to parse response body");
+                return; // handle the error
+            }
+        }
+
+        Timer::after(Duration::from_secs(5)).await;
     }
 }
